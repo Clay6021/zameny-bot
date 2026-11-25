@@ -3,7 +3,7 @@ name: check-schedule
 on:
   schedule:
     # каждые 10 минут, с 06:00 до 19:59 по Москве, пн-сб
-    - cron: "*/10 3-16 * * 1-6"
+    - cron: "7,22,37,52 3-16 * * 1-6"
   workflow_dispatch:
 
 permissions:
