@@ -154,7 +154,7 @@ def tg_post(method: str, **kwargs) -> None:
 def send_pdf(pdf: bytes, title: str, summary: str) -> None:
     chat_id = os.environ["TG_CHAT_ID"]
     # Необязательный номер темы (топика) группы; если не задан, пишем в общий чат
-    thread = os.environ.get("TG_THREAD_ID", "").strip()
+    thread = os.environ.get("TG_THREAD_ID", "20261").strip()
     target = {"chat_id": chat_id}
     if thread:
         target["message_thread_id"] = thread
