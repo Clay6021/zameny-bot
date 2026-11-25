@@ -6,14 +6,19 @@ import re
 import sys
 from pathlib import Path
 
+import pdfplumber
 import requests
 from pypdf import PdfReader
 
 URL = "https://mkgt.ru/z-l/"  # PDF с заменами, территория Люблино
 STATE_FILE = Path("state.json")
 
-TOKEN = os.environ["TG_TOKEN"]
-CHAT_ID = os.environ["TG_CHAT_ID"]
+# Группа, по которой бот пишет подробности. Можно сменить тут или через переменную WATCH_GROUP
+GROUP = os.environ.get("WATCH_GROUP", "ТоВХ-319")
+
+# Латинские буквы, похожие на кириллические (на случай опечаток в документе)
+_LOOKALIKE = str.maketrans("TOBXACEHKMPaceopxy", "ТОВХАСЕНКМРасеорху")
+_HEADER_WORDS = ("ПРЕПОДАВАТЕЛЬ", "ОСНОВАНИЕ", "ГРУППА", "НОМЕР", "ПРИМЕЧ")
 
 
 def fetch_pdf() -> bytes | None:
@@ -40,14 +45,105 @@ def get_title(text: str) -> str:
     return f"Изменения в расписании на {m.group(1)}" if m else "Изменения в расписании"
 
 
-def send_pdf(pdf: bytes, caption: str) -> None:
+# ---------- разбор замен для одной группы ----------
+
+def norm(s: str) -> str:
+    s = (s or "").translate(_LOOKALIKE)
+    s = re.sub(r"[\s ]+", "", s)
+    s = re.sub(r"[–—−‑]", "-", s)
+    return s.lower()
+
+
+def clean(cell) -> str:
+    s = " ".join((cell or "").split())
+    return re.sub(r"-{3,}", "—", s)
+
+
+def group_rows(pdf: bytes, group: str) -> tuple[list[list[str]], int]:
+    """Возвращает (строки замен нужной группы, общее число строк с данными в таблице)."""
+    target = norm(group)
+    found: list[list[str]] = []
+    total = 0
+    current = ""  # ячейка группы объединена по вертикали, поэтому протягиваем вниз
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        for page in doc.pages:
+            tables = page.extract_tables()
+            if not tables:
+                tables = page.extract_tables(
+                    {"vertical_strategy": "text", "horizontal_strategy": "text"}
+                )
+            for table in tables:
+                for row in table:
+                    cells = [clean(c) for c in row]
+                    if not cells:
+                        continue
+                    if any(w in " ".join(cells).upper() for w in _HEADER_WORDS):
+                        continue  # шапка таблицы
+                    if cells[0]:
+                        current = cells[0]
+                    if len([c for c in cells[1:] if c]) < 2:
+                        continue
+                    total += 1
+                    if target in norm(current):
+                        found.append(cells)
+    return found, total
+
+
+def format_row(cells: list[str]) -> str:
+    d = cells[1:]
+    if len(d) >= 6:
+        pair, old, reason, new, newpair, note = d[:6]
+        line = f"• {pair} пара: {old or '—'} → {new or '—'}"
+        extra = []
+        if reason:
+            extra.append(reason)
+        if newpair and newpair not in ("--", "—", "-") and newpair != pair:
+            extra.append(f"проведут {newpair} парой")
+        if note and note != "--":
+            extra.append(note)
+        if extra:
+            line += f" ({', '.join(extra)})"
+        return line
+    return "• " + " | ".join(c for c in d if c)
+
+
+def group_summary(pdf: bytes, text: str) -> str:
+    try:
+        rows, total = group_rows(pdf, GROUP)
+    except Exception as e:
+        print(f"Не удалось разобрать таблицу: {e}")
+        return f"{GROUP}: не удалось разобрать таблицу, смотрите файл."
+    if rows:
+        return f"{GROUP}, замены:\n" + "\n".join(format_row(r) for r in rows)
+    if total:
+        msg = f"{GROUP}: в таблице замен нет."
+        if norm(GROUP) in norm(text):
+            msg += " Группа указана в списках внизу документа (формат обучения или практика), смотрите файл."
+        return msg
+    return f"{GROUP}: не удалось разобрать таблицу, смотрите файл."
+
+
+# ---------- Telegram ----------
+
+def send_pdf(pdf: bytes, title: str, summary: str) -> None:
+    token = os.environ["TG_TOKEN"]
+    chat_id = os.environ["TG_CHAT_ID"]
+    caption = f"{title}\n\n{summary}" if summary else title
+    long_summary = len(caption) > 1024  # лимит подписи в Telegram
     r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendDocument",
-        data={"chat_id": CHAT_ID, "caption": caption},
+        f"https://api.telegram.org/bot{token}/sendDocument",
+        data={"chat_id": chat_id, "caption": title if long_summary else caption},
         files={"document": ("zameny-lyublino.pdf", pdf, "application/pdf")},
         timeout=120,
     )
     r.raise_for_status()
+    if long_summary:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": summary[:4000]},
+            timeout=60,
+        )
+        r.raise_for_status()
 
 
 def main() -> None:
@@ -64,12 +160,17 @@ def main() -> None:
         print("Без изменений")
         return
 
-    send_pdf(pdf, get_title(text))
+    send_pdf(pdf, get_title(text), group_summary(pdf, text))
     STATE_FILE.write_text(json.dumps({"hash": digest}))
     print("Отправлено")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--parse":
+        # Проверка без Telegram: python bot.py --parse файл.pdf
+        data = Path(sys.argv[2]).read_bytes()
+        print(group_summary(data, extract_text(data)))
+        sys.exit(0)
     try:
         main()
     except Exception as e:
